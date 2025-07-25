@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <title>BMP → Kurzformat</title>
+    <style>
+        body {
+            font-family: system-ui, Arial, sans-serif;
+            margin: 0;
+            padding: 1rem;
+            background: #f6f6f8
+        }
+
+        h1 {
+            font-size: 1.25rem;
+            margin: 0 0 .5rem
+        }
+
+        textarea {
+            width: 100%;
+            min-height: 14rem;
+            padding: .6rem;
+            margin-bottom: 1rem;
+            border: 1px solid #bbb;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: .9rem;
+            box-sizing: border-box;
+            resize: vertical
+        }
+
+        #out {
+            background: #fffef7
+        }
+
+        footer {
+            font-size: .75rem;
+            color: #666;
+            text-align: center;
+            margin-top: 1rem
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Bundesmedikationsplan → Kurzformat</h1>
+
+    <label for="in"><strong>Input – BMP Freitext</strong></label>
+    <textarea id="in" placeholder="Den Bundesmedikationsplan im SAP öffnen und per Strg+A, Strg+C in die Ablage kopieren, dann hier per Strg+V einfügen"></textarea>
+
+    <label for="out"><strong>Output – Kompakter Mediplan (evtl. unvollständig!)</strong></label>
+    <textarea id="out" readonly placeholder="Konvertierter Output erscheint hier..."></textarea>
+
+    <script src="https://cdn.jsdelivr.net/pyodide/v0.25.0/full/pyodide.js"></script>
+    <script>
+        (async () => {
+            const pyodide = await loadPyodide({ indexURL: "https://cdn.jsdelivr.net/pyodide/v0.25.0/full/" });
+
+            await pyodide.runPythonAsync(`
+from __future__ import annotations
+import re, unicodedata
+from typing import List
+UNITS={"tabl","tabletten","kapsel","rettabl","kautabl","pflast","lösung","infusio","inf","infus",
+       "injekt","mundtab","flasche","beutel","stück","kli","pflaster","ret","spray",
+       "mg","ml","ie","i.e.","g","µg","mcg","l"}
+NOISE={"barcode","adminblock","medikation","freitext","rezeptur","überschrift","speichern","drucken",
+       "hilfe","medikationsplan","für:","geb.","ausgedruckt","version","gewicht","größe","geschl.",
+       "wirkstoff","handelsname","stärke","form","einheit","hinweise","grund",
+       "fehler bei der barcodeerzeugung"}
+RE_STRENGTH=re.compile(r"\\d+[.,]?\\d*\\s*(mg|µg|μg|g|mcg|ie|i\\.e\\.?|ml|l)\\b",re.I)
+RE_DOSE_ROW=re.compile(r"^\\s*(\\d+[¼½¾.,/]*(?:\\s+\\d+[¼½¾.,/]*){2,3})\\s*$")
+RE_FREQ=re.compile(r"\\b(\\d+\\s*x\\s*/\\s*\\w+|alle\\s+\\d+\\s*Tage?|täglich|wöchentlich)\\b",re.I)
+FRACTION={"1/4":"¼","1/2":"½","3/4":"¾","0,25":"¼","0,5":"½","0,75":"¾",
+          "0.25":"¼","0.5":"½","0.75":"¾"}
+import re as _re
+PREFIX_TRASH=_re.compile(r"^(kombipräparat|zusammengesetztes arzneimittel oder i\\.v\\.-gabe)\\s+",_re.I)
+def _clean(t:str)->str:
+    t=unicodedata.normalize("NFKC",t).replace("μg","µg")
+    return ' '.join(PREFIX_TRASH.sub('',t).strip().split())
+def _is_noise(l:str)->bool: return any(k in l.lower() for k in NOISE)
+def _skip(l:str)->bool:
+    low=l.lower()
+    return (not l or low.split()[0] in UNITS or low[:1].isdigit() or
+            RE_DOSE_ROW.match(l) or RE_FREQ.search(l) or ';' in l or ':' in l or len(l)<3)
+def _frac(tok:str)->str:
+    if tok in FRACTION:return FRACTION[tok]
+    tok=tok.replace(',','.')
+    return tok[:-2] if tok.endswith('.0') else tok.replace('.' ,',')
+def _join(nums:List[str])->str:
+    while len(nums)>3 and nums[-1] in {'0','0,0','0.0'}: nums.pop()
+    return '-'.join(nums)
+def _uniq(seq): seen=set();out=[];[out.append(x) for x in seq if x not in seen or seen.add(x)];return out
+def _make(gen:str,brand:str)->str:
+    gen,brand=gen.strip(),brand.strip()
+    if gen and brand:
+        if gen.lower() in brand.lower() or brand.lower() in gen.lower(): return brand or gen
+        return f"{gen} ({brand})"
+    return gen or brand or "Unbekannt"
+def _parse(lines:List[str])->List[str]:
+    meds=[];i=0;N=len(lines);end=lambda l: not l or 'bedarfsmedikation' in l.lower()
+    while i<N:
+        if not RE_STRENGTH.search(lines[i]): i+=1;continue
+        b=i-1
+        while b>=0 and _skip(lines[b]): b-=1
+        brand=lines[b] if b>=0 else ''
+        gen=[];b-=1
+        while b>=0 and not end(lines[b]):
+            if not _skip(lines[b]): gen.insert(0,lines[b])
+            b-=1
+        name=_make(' '.join(gen),brand)
+        strength=[]
+        while i<N and RE_STRENGTH.search(lines[i]):
+            strength.append(_clean(RE_STRENGTH.search(lines[i]).group(0))); i+=1
+        strength=' / '.join(_uniq(strength))
+        dose='';j=i
+        while j<N and not RE_STRENGTH.search(lines[j]) and not end(lines[j]):
+            if RE_DOSE_ROW.match(lines[j]):
+                nums=RE_DOSE_ROW.match(lines[j]).group(1).split()
+                dose=_join([_frac(n) for n in nums]); break
+            if (m:=RE_FREQ.search(lines[j])): dose=_clean(m.group(0)); break
+            j+=1
+        meds.append(f"{name} {strength} {dose}".strip())
+        i=j if j>i else i+1
+    return _uniq(meds)
+def _split(raw):
+    try:
+        idx=next(i for i,l in enumerate(raw) if 'bedarfsmedikation' in l.lower())
+        reg_raw,prn_raw=raw[:idx],raw[idx+1:]
+    except StopIteration:
+        reg_raw,prn_raw=raw,[]
+    reg=[_clean(l) for l in reg_raw if not _is_noise(_clean(l))]
+    prn=[_clean(l) for l in prn_raw if not _is_noise(_clean(l))]
+    return reg,prn
+def format_plan(txt:str)->str:
+    reg_block,prn_block=_split(txt.splitlines())
+    regular=_parse(reg_block)
+    prn=_parse(prn_block)
+    out=regular
+    if prn: out+=['','Bei Bedarf:']+prn
+    result='\\n'.join(out).strip()
+    result=result.replace('Zusammengesetztes Arzneimittel oder i.v.-Gabe ','').replace('Zusammengesetztes Arzneimittel oder i.v.-Gabe','')
+    return result
+`);
+            const formatPlan = pyodide.globals.get("format_plan");
+
+            const inputTA = document.getElementById("in");
+            const outputTA = document.getElementById("out");
+
+            function runConverter() {
+                try {
+                    outputTA.value = formatPlan(inputTA.value).toString();
+                } catch (err) {
+                    outputTA.value = "⚠️  " + err;
+                }
+            }
+
+            ["input", "change", "keyup", "paste", "drop"].forEach(ev =>
+                inputTA.addEventListener(ev, runConverter)
+            );
+        })();
+    </script>
+
+    <footer>Läuft lokal im Browser; keine Daten werden verschickt!</footer>
+</body>
+
+</html>
